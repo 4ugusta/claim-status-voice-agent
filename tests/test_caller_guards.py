@@ -91,3 +91,39 @@ def test_what_the_model_says_is_fit_to_say():
     assert caller.speakable("The claim is 48213, thanks.") == "The claim is 4, 8, 2, 1, 3, thanks."
     assert caller.asks_something("Can I get the claim number?") and caller.asks_something("Is that all?")
     assert not caller.asks_something("Let me look that up for you.")
+
+
+def test_the_handoff_briefing_never_carries_text_from_the_call():
+    # whatever the model or the insurer's line says, a colleague only ever hears one of these fixed reasons
+    for brief in caller.HANDOFF_REASONS.values():
+        assert "{" not in brief and len(brief) < 80
+    assert set(caller.HANDOFF_REASONS) >= {"repeating", "no_progress", "too_long", "line_failed", "no_status"}
+
+
+async def test_two_handoffs_at_once_dial_the_person_once(tmp_path, monkeypatch):
+    # the stuck check, the silence watchdog, the time limit and the tool can all fire together
+    import asyncio
+    from types import SimpleNamespace
+
+    from claimcall import config
+    from claimcall.calllog import CallLog
+
+    monkeypatch.setattr(config, "HANDOFF_NUMBER", "+15550000009")
+    monkeypatch.setattr(config, "OUTBOUND_TRUNK_ID", "ST_test")
+    dials = []
+
+    async def slow_dial(request):
+        dials.append(request.sip_call_to)
+        await asyncio.sleep(0.05)  # the person's phone ringing
+
+    ctx = SimpleNamespace(
+        room=SimpleNamespace(name="room"), api=SimpleNamespace(sip=SimpleNamespace(create_sip_participant=slow_dial))
+    )
+    agent = caller.ClaimCaller(
+        CallJob(claim_number="48213", phone_number="+15551234567"), CallLog("call", tmp_path), ctx
+    )
+    spoken = []
+    monkeypatch.setattr(agent, "say", lambda text, **_: spoken.append(text))
+    await asyncio.gather(agent.hand_off("no_progress", "watchdog"), agent.hand_off("too_long", "timer"))
+    assert dials == ["+15550000009"]
+    assert len(spoken) == 1 and "48213" not in spoken[0] and "4, 8, 2, 1, 3" in spoken[0]

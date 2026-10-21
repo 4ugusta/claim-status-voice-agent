@@ -95,6 +95,9 @@ shown at the moment it happened (`uv sync --group demo` adds Pillow; it needs ff
     pauses. Left to the model they were said three times, over the person, while they looked the claim up.
     The model may answer only a question asked after its last line.
   - *Stuck is also silence,* which no turn reports: a watchdog nudges a quiet person and hands off after 60 s.
+  - *A colleague hears only trusted words.* The hand-off briefing is the claim number and a fixed reason chosen in
+    code. The model's wording and the insurer's words, either of which the far end can steer, go to the log only.
+    And four triggers (repeats, silence, the time limit, the model) firing together dial the person once.
 - **A stereo recording beside the log,** because a log can be wrong. During testing it said lines were spoken
   that never were; the agent's channel was silent. The recording showed it.
 

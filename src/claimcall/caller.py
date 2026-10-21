@@ -191,6 +191,17 @@ def line_reports_failure(heard: list[str]) -> bool:
     return any(FAILURE_CUES.search(line) for line in heard)
 
 
+# What a person brought onto the call is told, by code. Nothing from the call itself is ever read to them.
+HANDOFF_REASONS = {
+    "repeating": "the menu keeps repeating itself without an option for claims",
+    "no_progress": "the call stopped making progress",
+    "too_long": "the call has run too long without a status",
+    "line_failed": "their line says it cannot find or handle the claim",
+    "person_cannot_help": "the person on their side could not give me the status",
+    "no_status": "I could not get the status",
+}
+
+
 def stuck_reason(since_progress: list[str], seconds: float) -> str | None:
     """Why the call is stuck, or None. Stuck is the line repeating itself or time passing, never fragments."""
     counts: dict[str, int] = {}
@@ -225,6 +236,7 @@ class ClaimCaller(Agent):
         # arrives while the opener plays. The model may answer only questions asked after it.
         self.answered_upto = 0
         self.finished = False
+        self.handing_off = False
         # After a key or the claim number, the agent waits for the line to answer before doing anything else:
         # a model can chain tool calls in one turn, and once called "stuck" two seconds before the status came.
         self.waiting_for_line = False
@@ -258,7 +270,7 @@ class ClaimCaller(Agent):
         if self.active:
             reason = stuck_reason(self.since_progress, time.monotonic() - self.last_progress)
             if reason:
-                await self.hand_off(reason)
+                await self.hand_off("repeating" if "times without" in reason else "no_progress", reason)
                 raise StopResponse()
 
     def _progress(self) -> None:
@@ -464,7 +476,8 @@ class ClaimCaller(Agent):
             # Only the line saying something failed, or a person who cannot help, justifies giving up early;
             # a line that loops is caught in code (stuck_reason). Once a model gave up mid readback.
             return "Nothing on the line says you are stuck. Keep listening and act on its next prompt."
-        await self.hand_off(reason)
+        why = "line_failed" if line_reports_failure(self.since_progress[-4:]) else "person_cannot_help"
+        await self.hand_off(why, reason)
         return "Handed off. Say nothing more."
 
     @function_tool
@@ -516,7 +529,7 @@ class ClaimCaller(Agent):
                 self.last_nudge = now
                 self.say(f"Sorry, are you able to check the status of claim {claims.spoken(self.job.claim_number)}?")
             if self.status is None and now - self.last_progress >= config.NO_PROGRESS_SECONDS:
-                await self.hand_off(f"{int(now - self.last_progress)} seconds without getting closer to the status")
+                await self.hand_off("no_progress", f"{int(now - self.last_progress)} s without progress")
 
     # --- the line ---------------------------------------------------------------------------------------------
 
@@ -536,13 +549,21 @@ class ClaimCaller(Agent):
         await asyncio.sleep(0.5)
         await self.ctx.api.room.delete_room(api.DeleteRoomRequest(room=self.ctx.room.name))
 
-    async def hand_off(self, reason: str) -> None:
-        """Task bonus: when stuck, dial a person into the call, brief them, and leave them with the line."""
-        if self.finished:
+    async def hand_off(self, why: str, detail: str = "") -> None:
+        """Task bonus: when stuck, dial a person into the call, brief them, and leave them with the line.
+
+        `why` is one of HANDOFF_REASONS, chosen by code; it is the only thing said to the person, with the claim
+        number. `detail` (the model's words, or the line's) goes to the log only, capped: either can be steered by
+        whoever is on the insurer's end, and must never be read to a colleague (security review, 22 Oct 2026).
+        The flag is set before the first await, so the stuck check, the watchdog, the time limit and the tool
+        firing together dial the handoff number once."""
+        if self.finished or self.handing_off:
             return
-        self.log.step("stuck", reason=reason)
+        self.handing_off = True
+        brief = HANDOFF_REASONS.get(why, HANDOFF_REASONS["no_status"])
+        self.log.step("stuck", reason=brief, detail=detail[:200], detail_is="untrusted text from the call")
         if self.job.loopback or not (config.HANDOFF_NUMBER and config.OUTBOUND_TRUNK_ID):
-            self.log.step("handoff", result="no handoff number set: a person needs to call back", reason=reason)
+            self.log.step("handoff", result="no handoff number set: a person needs to call back", reason=brief)
             await self.hang_up("needs a person")
             return
         self.log.step("handoff", result="dialing", to=masked(config.HANDOFF_NUMBER))
@@ -564,7 +585,7 @@ class ClaimCaller(Agent):
         self.person = True
         self.say(
             f"Hi, this is the claim status assistant. I'm on the line with the insurer about claim "
-            f"{claims.spoken(self.job.claim_number)}, and I'm stuck: {reason}. You're connected to them now."
+            f"{claims.spoken(self.job.claim_number)}, and {brief}. You're connected to them now."
         )
         self.log.step("handoff", result="connected")
         self.finished = True  # the person has the call; the agent stops acting on it
@@ -659,7 +680,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async def give_up_after_max() -> None:
         await asyncio.sleep(config.MAX_CALL_SECONDS)
         if not agent.finished:
-            await agent.hand_off(f"no status after {int(config.MAX_CALL_SECONDS)} seconds")
+            await agent.hand_off("too_long", f"no status after {int(config.MAX_CALL_SECONDS)} s")
 
     asyncio.create_task(give_up_after_max())
 
