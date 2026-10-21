@@ -246,7 +246,8 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.room.local_participant.set_attributes({"claimcall.role": "helpline"})
     kinds = [rtc.ParticipantKind.PARTICIPANT_KIND_AGENT] if loopback else [rtc.ParticipantKind.PARTICIPANT_KIND_SIP]
     caller = await ctx.wait_for_participant(kind=kinds)
-    logger.info("call from %s", caller.identity)
+    sip_attrs = {k: v for k, v in caller.attributes.items() if k.startswith("sip.")}
+    logger.info("call from %s, variant %s, %s", caller.identity, meta.get("variant", "standard"), sip_attrs)
 
     session = AgentSession(stt=config.STT, llm=config.LLM, tts=config.HELPLINE_TTS)
     menu = Menu(MENU_NO_CLAIMS if meta.get("variant") == "representative" else MENU)

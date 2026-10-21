@@ -58,6 +58,23 @@ uv run python scripts/call.py --to <the helpline number> --claim 48213
 A LiveKit number is its own trunk, so the helpline's dispatch rule is limited to it by its id and never sees
 calls meant for anything else in the project.
 
+### A SIP call with no carrier
+
+The free way to run the telephony path. The agent's outbound trunk points at the project's own SIP URI, so each
+call is a real SIP call (dialled, answered, keypad tones sent on the call, the greeting classified from its audio)
+that never reaches a phone carrier.
+
+```bash
+uv run python scripts/setup_telephony.py sip-only --sip-uri <id>.sip.livekit.cloud   # prints SIP_OUTBOUND_TRUNK_ID
+uv run python scripts/call.py --to +12025550143 --claim 48213    # the menu
+uv run python scripts/call.py --to +12025550144 --claim 48213    # no claims option: reach a person
+```
+
+The two trunks share a generated password that is never printed: a project's SIP URI is easy to find, and an open
+trunk would answer anyone who dials it. Each helpline number has its own inbound trunk and dispatch rule, and the
+rule tells the helpline which menu to play. (One trunk with a rule per number does not work: LiveKit dropped the
+rules' number filter and sent both numbers to the first rule.)
+
 ## What a call leaves behind
 
 `scripts/call.py` prints each step as it happens, then writes:
@@ -103,25 +120,40 @@ shown at the moment it happened (`uv sync --group demo` adds Pillow; it needs ff
 
 ## Results
 
-Loopback test calls on the final code, each a fresh call against the mock helpline:
+SIP calls on the final code ([a SIP call with no carrier](#a-sip-call-with-no-carrier)), each a fresh call: the
+agent dials out through its trunk, the helpline answers on its own, and the keys go as keypad tones on the call.
 
 | Call | Outcome | Time |
 |---|---|---|
-| Menu, claim 48213 | approved, keys `1` then `48213#` | 37.6 s |
-| Menu, claim 51007 | pending review | 29.7 s |
-| Menu, claim 66120 | denied | 38.9 s |
-| Menu, claim 99999 (does not exist) | no status, a person needs to call back: nothing invented | 33.8 s |
-| No claims option, claim 48213 | pressed `0`, a person detected, approved | 46.3 s |
-| No claims option, claim 51007 | pending review, from the person | 39.0 s |
-| No claims option, claim 66120 | denied, from the person | 62.7 s |
+| Menu, claim 48213 | approved, keys `1` then `48213#` | 42.5 s |
+| Menu, claim 51007 | pending review | 40.6 s |
+| Menu, claim 66120 | denied | 38.4 s |
+| Menu, claim 99999 (does not exist) | no status, a person needs to call back: nothing invented | 42.7 s |
+| No claims option, claim 48213 | pressed `0`, a person detected, approved | 52.3 s |
+| No claims option, claim 51007 | pending review, from the person | 51.3 s |
+| No claims option, claim 66120 | denied, from the person | 46.2 s |
 
-7 of 7 correct (22 Oct 2026). Every status was checked against the words heard. Two of the logs are in
-[`logs/sample/`](logs/sample/).
+7 of 7 correct (22 Oct 2026). Every status was checked against the words heard, and the claim number was given
+once in every call. The same seven calls in loopback, on the code before the three fixes below, were also 7 of 7
+(29.7 to 62.7 s). Samples of both are in [`logs/sample/`](logs/sample/).
+
+The SIP calls caught three things loopback had not:
+
+- *The number said twice.* One model turn noted the person and gave the number while the opener waited for the
+  person to pause, so the number was said, then said again inside the opener. The number now waits for the opener.
+- *A nudge over the answer.* The silence watchdog counted from when the eight second opener was queued, so it asked
+  "are you able to check" six seconds after the opener ended, as the person read out the status. Quiet now counts
+  from the end of speech.
+- *A refused login left the test hanging.* Once in 14 calls LiveKit refused the trunk's password (401). The agent
+  logged it as no answer, but left the room open, and `call.py` waited out the time limit. A failed dial now
+  closes the room as a hang-up does.
 
 ## What I'd improve next
 
 - **Remember each insurer's menu.** The path to claim status rarely changes. Keep the keys that worked per
   number and press ahead, falling back to the model when a prompt no longer matches.
+- **Retry a failed dial.** A refused login or a busy line ends the call as no answer. One retry after a short
+  wait, then a callback later, would have saved the one refused SIP login above.
 - **Hold queues.** Real insurer lines hold for ten to forty minutes. Detect hold music, stay silent and cheap,
   and pick back up when a person or a prompt returns.
 - **Structured answers.** Status, paid amount, dates and denial reasons with a schema and a confidence,

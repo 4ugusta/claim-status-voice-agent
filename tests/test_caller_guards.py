@@ -127,3 +127,28 @@ async def test_two_handoffs_at_once_dial_the_person_once(tmp_path, monkeypatch):
     await asyncio.gather(agent.hand_off("no_progress", "watchdog"), agent.hand_off("too_long", "timer"))
     assert dials == ["+15550000009"]
     assert len(spoken) == 1 and "48213" not in spoken[0] and "4, 8, 2, 1, 3" in spoken[0]
+
+
+async def test_the_number_is_said_once_when_the_person_is_noted_and_the_number_asked_together(tmp_path, monkeypatch):
+    # a SIP call on 22 Oct: one model turn noted the person and gave the number while the opener waited for a pause
+    import asyncio
+    from types import SimpleNamespace
+
+    from claimcall.calllog import CallLog
+
+    agent = caller.ClaimCaller(
+        CallJob(claim_number="48213", phone_number="+15551234567"), CallLog("call", tmp_path), SimpleNamespace()
+    )
+    spoken = []
+    monkeypatch.setattr(agent, "say", lambda text, **_: spoken.append(text))
+
+    async def a_pause():
+        await asyncio.sleep(0.05)  # the person finishing "how can I help you today?"
+
+    monkeypatch.setattr(agent, "wait_for_quiet", a_pause)
+    opener = asyncio.create_task(agent.greet_person("conversation", "This is Dana in claims. How can I help you?"))
+    await asyncio.sleep(0)
+    told = await agent.give_claim_number(None, "voice")
+    await opener
+    assert "opener" in told
+    assert sum("4, 8, 2, 1, 3" in line for line in spoken) == 1

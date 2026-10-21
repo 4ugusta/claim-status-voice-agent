@@ -244,6 +244,9 @@ class ClaimCaller(Agent):
         # The claim number is given once, unless the line says it could not find it or asks again.
         self.claim_given = False
         self.asked_again = False
+        # The opener carries the number. While it waits for the person to pause, nothing else may say it: the
+        # model once noted the person and gave the number in one turn, and the number was said twice in a row.
+        self.opener_pending = False
 
     # --- what the line says ---------------------------------------------------------------------------------
 
@@ -282,7 +285,7 @@ class ClaimCaller(Agent):
     async def tts_node(self, text, model_settings):
         said = "".join([chunk async for chunk in text]).strip()
         spoken = speakable(said)
-        if not self.person or not spoken or not self._may_speak():
+        if not self.person or self.opener_pending or not spoken or not self._may_speak():
             # Muted while a menu talks, and with a person unless they asked something: left free, the model
             # repeated "I need the status of claim 48213" four times while the person looked it up.
             return
@@ -326,18 +329,21 @@ class ClaimCaller(Agent):
         were said two or three times, and it talked over the person while they gave the status."""
         if self.person:
             return
-        self.person = True
+        self.person, self.opener_pending = True, True
         self.acted_at = time.monotonic()  # the model stays quiet from here until the opener is out
         self.log.step("live_person", evidence=evidence, detected_by=detected_by)
-        # Wait for the person to pause: said into "how can I help you today", the opener was cut off, the person
-        # never heard the number, and both sides waited until the time limit.
-        await self.wait_for_quiet()
         number = self.job.claim_number
-        self.say(
-            "Hi, this is an automated assistant calling for a doctor's billing office. "
-            f"I'm checking on the status of claim number {claims.spoken(number)}.",
-            interruptible=False,
-        )
+        try:
+            # Wait for the person to pause: said into "how can I help you today", the opener was cut off, the
+            # person never heard the number, and both sides waited until the time limit.
+            await self.wait_for_quiet()
+            self.say(
+                "Hi, this is an automated assistant calling for a doctor's billing office. "
+                f"I'm checking on the status of claim number {claims.spoken(number)}.",
+                interruptible=False,
+            )
+        finally:
+            self.opener_pending = False
         self.claim_given, self.asked_again = True, False
         self.log.step("claim_number_given", claim_number=number, how="voice")
         self.acted_at = time.monotonic()
@@ -402,6 +408,8 @@ class ClaimCaller(Agent):
             return "The call is over. Do nothing more."
         if self.waiting_for_line:
             return "Wait: the line has not answered yet."
+        if self.opener_pending:
+            return "Your opener is about to give the claim number. Wait for the person to answer it."
         if self.claim_given and not self.asked_again:
             return "You already gave the claim number. Wait for the line to answer."
         if not self.person and not asks_for_number(self.since_progress[-4:]):
@@ -518,6 +526,10 @@ class ClaimCaller(Agent):
             await asyncio.sleep(1.0)
             now = time.monotonic()
             quiet = self.session.user_state != "speaking" and self.session.agent_state != "speaking"
+            if not quiet:
+                # Quiet counts from the end of speech. Counted from when the eight second opener was queued, the
+                # nudge came six seconds after it ended, over the person reading out the status.
+                self.last_activity = now
             if (
                 self.person
                 and self.status is None
@@ -671,6 +683,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             except api.TwirpError as exc:
                 log.step("no_answer", sip_status=exc.metadata.get("sip_status_code"), detail=exc.message)
+                # Close the room as a hang-up does: shutting down alone left anyone watching the call waiting
+                # out the time limit (a refused SIP login, 22 Oct 2026).
+                await agent.hang_up("no answer")
                 ctx.shutdown("no answer")
                 return
             log.step("answered", line="phone")

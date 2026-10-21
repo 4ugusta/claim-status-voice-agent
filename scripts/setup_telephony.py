@@ -12,16 +12,21 @@ The helpline gets a phone number; the agent gets a way to dial out.
     python scripts/setup_telephony.py outbound --address example.pstn.twilio.com \\
         --number +15550000002 --username USER --password PASS
 
+    # or no carrier at all: the agent calls the helpline over SIP, straight into this project
+    python scripts/setup_telephony.py sip-only --sip-uri abc123.sip.livekit.cloud
+
 Each step prints what it made. Put the outbound trunk id in .env as SIP_OUTBOUND_TRUNK_ID.
 LiveKit Phone Numbers only take calls in (docs.livekit.io/telephony/start/phone-numbers), so the agent's own
-calls always go through a carrier's trunk.
+calls go through a carrier's trunk, or, with sip-only, through a trunk that points back at this project.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -48,16 +53,20 @@ async def livekit_numbers(method: str, body: dict) -> dict:
         return await resp.json()
 
 
-async def dispatch_rule(lk: api.LiveKitAPI, trunk_id: str, label: str) -> str:
+async def dispatch_rule(lk: api.LiveKitAPI, trunk_id: str, label: str, variant: str | None = None) -> str:
     """Calls to the helpline number start a room with the mock insurer in it, one room per call. A LiveKit number
     is its own trunk, so the rule is limited to it by its id and never sees calls meant for anything else in the
     project. (Setting the rule at purchase, or on the number afterwards, is refused; this is how the project's
-    other numbers are wired.)"""
+    other numbers are wired.) A variant tells the helpline which menu to play, as --variant does in a loopback
+    call."""
+    agent = api.RoomAgentDispatch(
+        agent_name=config.HELPLINE_AGENT, metadata=json.dumps({"variant": variant}) if variant else ""
+    )
     rule = sip.SIPDispatchRuleInfo(
         name=f"{config.HELPLINE_AGENT}-{label}",
         rule=sip.SIPDispatchRule(dispatch_rule_individual=sip.SIPDispatchRuleIndividual(room_prefix="helpline-")),
         trunk_ids=[trunk_id],
-        room_config=api.RoomConfiguration(agents=[api.RoomAgentDispatch(agent_name=config.HELPLINE_AGENT)]),
+        room_config=api.RoomConfiguration(agents=[agent]),
     )
     made = await lk.sip.create_dispatch_rule(api.CreateSIPDispatchRuleRequest(dispatch_rule=rule))
     return made.sip_dispatch_rule_id
@@ -116,6 +125,48 @@ async def outbound(args: argparse.Namespace) -> None:
         await lk.aclose()
 
 
+async def sip_only(args: argparse.Namespace) -> None:
+    """A real SIP call with no carrier: the agent's outbound trunk points at this project's own SIP URI, and the
+    helpline answers it on an inbound trunk. Both ends share a generated password (kept only in LiveKit, never
+    printed), because a project's SIP URI is easy to find and an open trunk would answer anyone who dials it.
+    The helpline answers on two numbers: the menu with a claims option, and the variant without one. Each number
+    has its own trunk, because a dispatch rule's own number filter is not kept (LiveKit Cloud dropped it and sent
+    both numbers to one rule, 22 Oct 2026); a rule limited to a trunk id is what holds."""
+    username, password = f"claimcall-{secrets.token_hex(4)}", secrets.token_urlsafe(24)
+    lk = api.LiveKitAPI()
+    try:
+        lines = []
+        for number, variant in ((args.number, None), (args.representative_number, "representative")):
+            inbound = await lk.sip.create_inbound_trunk(
+                api.CreateSIPInboundTrunkRequest(
+                    trunk=api.SIPInboundTrunkInfo(
+                        name=f"{config.HELPLINE_AGENT} sip-only {number}",
+                        numbers=[number],
+                        auth_username=username,
+                        auth_password=password,
+                    )
+                )
+            )
+            rule = await dispatch_rule(lk, inbound.sip_trunk_id, f"sip-{number}", variant)
+            lines.append(f"helpline, {variant or 'the menu'}: {number} (trunk {inbound.sip_trunk_id}, rule {rule})")
+        outbound = await lk.sip.create_outbound_trunk(
+            api.CreateSIPOutboundTrunkRequest(
+                trunk=api.SIPOutboundTrunkInfo(
+                    name=f"{config.CALLER_AGENT} sip-only",
+                    address=args.sip_uri.removeprefix("sip:"),
+                    numbers=[args.caller_id],
+                    auth_username=username,
+                    auth_password=password,
+                )
+            )
+        )
+        print("\n".join(lines))
+        print(f"SIP_OUTBOUND_TRUNK_ID={outbound.sip_trunk_id}")
+        print(f"then: python scripts/call.py --to {args.number} --claim 48213")
+    finally:
+        await lk.aclose()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="what", required=True)
@@ -129,8 +180,13 @@ def main() -> None:
     o.add_argument("--number", required=True, help="the caller ID to call from, E.164, owned on that carrier")
     o.add_argument("--username", required=True)
     o.add_argument("--password", required=True)
+    s = sub.add_parser("sip-only", help="a helpline and an outbound trunk that meet inside this project")
+    s.add_argument("--sip-uri", required=True, help="this project's SIP URI (LiveKit Cloud, Settings)")
+    s.add_argument("--number", default="+12025550143", help="the helpline's number there (555-01xx, a test range)")
+    s.add_argument("--representative-number", default="+12025550144", help="the same line with no claims option")
+    s.add_argument("--caller-id", default="+12025550188", help="the number the agent calls from")
     args = ap.parse_args()
-    asyncio.run(helpline(args) if args.what == "helpline" else outbound(args))
+    asyncio.run({"helpline": helpline, "outbound": outbound, "sip-only": sip_only}[args.what](args))
 
 
 if __name__ == "__main__":
