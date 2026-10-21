@@ -1,0 +1,23 @@
+{"t": 3.04, "at": "2026-10-21T18:37:59.006+00:00", "step": "answered", "line": "mock helpline in the same room (loopback)"}
+{"t": 5.44, "at": "2026-10-21T18:38:01.403+00:00", "step": "heard", "text": "Thank you for calling Northwind Health."}
+{"t": 7.24, "at": "2026-10-21T18:38:03.205+00:00", "step": "heard", "text": "For claims, press one."}
+{"t": 8.95, "at": "2026-10-21T18:38:04.910+00:00", "step": "heard", "text": "For billing,"}
+{"t": 9.99, "at": "2026-10-21T18:38:05.954+00:00", "step": "heard", "text": "press two."}
+{"t": 12.35, "at": "2026-10-21T18:38:08.314+00:00", "step": "heard", "text": "For pharmacy benefits,"}
+{"t": 13.29, "at": "2026-10-21T18:38:09.252+00:00", "step": "heard", "text": "press three."}
+{"t": 16.25, "at": "2026-10-21T18:38:12.213+00:00", "step": "heard", "text": "To speak with a representative, press zero."}
+{"t": 17.48, "at": "2026-10-21T18:38:13.442+00:00", "step": "answered_by", "category": "machine-ivr", "greeting": "Thank you for calling Northwind Health. For claims, press one. For billing, press two. For pharmacy benefits, press three. To speak with a representative, press zero."}
+{"t": 18.6, "at": "2026-10-21T18:38:14.567+00:00", "step": "pressed", "keys": "1", "why": "claims"}
+{"t": 21.85, "at": "2026-10-21T18:38:17.814+00:00", "step": "heard", "text": "Claims. Please enter your five digit claim number on your keypad."}
+{"t": 23.45, "at": "2026-10-21T18:38:19.415+00:00", "step": "heard", "text": "Followed by the pound key."}
+{"t": 25.26, "at": "2026-10-21T18:38:21.219+00:00", "step": "heard", "text": "You can also say,"}
+{"t": 26.66, "at": "2026-10-21T18:38:22.623+00:00", "step": "pressed", "keys": "48213#", "why": "claim number"}
+{"t": 26.66, "at": "2026-10-21T18:38:22.624+00:00", "step": "claim_number_given", "claim_number": "48213", "how": "keypad"}
+{"t": 29.55, "at": "2026-10-21T18:38:25.515+00:00", "step": "heard", "text": "claim number four, eight thousand two hundred thirteen,"}
+{"t": 31.5, "at": "2026-10-21T18:38:27.461+00:00", "step": "heard", "text": "The status of this claim is"}
+{"t": 32.79, "at": "2026-10-21T18:38:28.754+00:00", "step": "heard", "text": "approved,"}
+{"t": 34.16, "at": "2026-10-21T18:38:30.120+00:00", "step": "status_captured", "status": "approved", "verbatim": "The status of this claim is approved"}
+{"t": 34.16, "at": "2026-10-21T18:38:30.121+00:00", "step": "hung_up", "reason": "status captured"}
+{"t": 34.59, "at": "2026-10-21T18:38:30.558+00:00", "step": "heard", "text": "To hear this again, press nine."}
+{"t": 36.39, "at": "2026-10-21T18:38:32.352+00:00", "step": "heard", "text": "To return"}
+{"t": 37.58, "at": "2026-10-21T18:38:33.540+00:00", "step": "summary", "outcome": "status_found", "claim_status": "approved", "heard_verbatim": "The status of this claim is approved", "answered_by": "machine-ivr", "keys_pressed": "148213#", "live_person": false, "handed_off": false, "seconds": 37.6, "claim_number": "48213", "to": "loopback"}
