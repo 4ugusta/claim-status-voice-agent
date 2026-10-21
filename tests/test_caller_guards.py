@@ -175,23 +175,28 @@ def test_only_a_refused_login_or_a_timeout_is_dialled_again():
     assert not caller.worth_redialing("INVITE failed: sip status: 486: Busy Here")
 
 
-async def test_a_call_with_its_status_is_never_handed_off(tmp_path, monkeypatch):
+async def test_a_call_with_its_status_is_never_handed_off_but_still_ends(tmp_path, monkeypatch):
     # a SIP call on 22 Oct: after "approved" was recorded, the model asked for a human "to complete the call
-    # politely", and the log said the person could not give the status
+    # politely", and the log said the person could not give the status. A limit that fires must still hang up.
     from types import SimpleNamespace
 
     from claimcall.calllog import CallLog
 
+    deleted = []
+
+    async def delete_room(request):
+        deleted.append(request.room)
+
+    ctx = SimpleNamespace(
+        room=SimpleNamespace(name="room"), api=SimpleNamespace(room=SimpleNamespace(delete_room=delete_room))
+    )
     agent = caller.ClaimCaller(
-        CallJob(claim_number="48213", phone_number="+15551234567"), CallLog("call", tmp_path), SimpleNamespace()
+        CallJob(claim_number="48213", phone_number="+15551234567"), CallLog("call", tmp_path), ctx
     )
     agent.person, agent.status = True, "approved"
     told = await agent.ask_for_human(None, "complete call politely")
-    await agent.hand_off("no_progress", "watchdog")  # nothing to dial: it must return before touching the line
-    steps = (
-        [line for line in (tmp_path / "call.jsonl").read_text().splitlines() if line]
-        if (tmp_path / "call.jsonl").exists()
-        else []
-    )
-    assert "end_call" in told
+    assert "end_call" in told and not agent.finished
+    await agent.hand_off("too_long", "timer")  # the time limit
+    steps = [line for line in (tmp_path / "call.jsonl").read_text().splitlines() if line]
+    assert deleted == ["room"] and agent.finished
     assert not any('"step": "stuck"' in s or '"step": "handoff"' in s for s in steps)

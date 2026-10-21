@@ -620,7 +620,12 @@ class ClaimCaller(Agent):
         whoever is on the insurer's end, and must never be read to a colleague (security review, 22 Oct 2026).
         The flag is set before the first await, so the stuck check, the watchdog, the time limit and the tool
         firing together dial the handoff number once."""
-        if self.finished or self.handing_off or self.status is not None:  # a call with its status needs nobody
+        if self.finished or self.handing_off:
+            return
+        if self.status is not None:
+            # A call with its status needs nobody, but a limit that fires must still end it (security review,
+            # 22 Oct 2026: returning here alone let the time limit pass and the call run on).
+            await self.hang_up(f"status recorded ({why})")
             return
         self.handing_off = True
         brief = HANDOFF_REASONS.get(why, HANDOFF_REASONS["no_status"])
