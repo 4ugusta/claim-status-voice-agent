@@ -3,6 +3,27 @@
 An outbound voice agent that calls an insurer's helpline, works through its phone menu, gives a claim
 number, asks for the claim's status, and logs every step of the call.
 
+**Watch a test call:** [docs/test-call.mp4](docs/test-call.mp4), a screen recording of two SIP calls (98 s): the
+menu, then a person. The sound is each call's own recording, both sides, keypad tones included.
+
+**How it calls:** over SIP to the helpline's own trunk inside LiveKit, at no cost; a carrier's trunk (Twilio,
+Telnyx) swaps in with one setup command ([how](#a-real-phone-call)).
+
+**Run it:** start the two workers, then `uv run python scripts/call.py --loopback --claim 48213` ([how](#run-it)).
+
+**Design, in four lines.** LiveKit Agents for both ends: one SDK for SIP, keypad tones, audio and the agent loop,
+with answering machine detection to say who picked up. The helpline is a fixed state machine, so the test
+target never adapts to the agent's mistakes. The model chooses and code holds it to the task: a key must be on
+the menu just read out, a status must have been said on the line, the claim number goes once and only when
+asked. Every step is logged as it happens, beside a stereo recording of both sides, because a log can be wrong.
+
+**Scope.** The core is the `src/claimcall` package: the helpline, the agent and the step log. Most of the rest
+came from testing it on real calls: each code guard under [Design choices](#design-choices) names the test call
+that needed it, and the SIP setup exists so a test is a real call at no cost.
+
+**Next:** remember each insurer's menu path, wait out hold queues cheaply, and return the status as structured
+fields (amount, dates, denial reason) with a confidence.
+
 ```
  claim-caller (the agent)                                mock-insurer (the helpline)
  ────────────────────────                                ───────────────────────────
@@ -20,7 +41,7 @@ number, asks for the claim's status, and logs every step of the call.
 | Task | Where |
 |---|---|
 | 1. A mock insurer helpline with a basic menu | `src/claimcall/helpline.py`: Northwind Health. Claims 1, billing 2, pharmacy 3, a representative 0. The claim number by keypad or voice, fixed statuses (`48213` approved, `51007` pending review, `66120` denied), re-prompts on silence and a goodbye after two. |
-| 2. Navigate the menu by pressing the right option | `press_keys` sends DTMF. The model picks the option; the code checks the key against the options the menu actually read out. |
+| 2. Navigate the menu by pressing the right option | `press_keys` sends DTMF, and plays the keypad tones on the line so a listener hears each press. The model picks the option; the code checks the key against the options the menu actually read out. |
 | 3. Give the claim number, ask for the status | `give_claim_number` keys it with `#` when the line asks; with a person, the agent says it in its opener. |
 | 4. Capture the status and log each step | `record_claim_status` keeps the status and the sentence it came from, only if those words were heard. Every step is logged with its time. |
 | Bonus: detect a live person | LiveKit's answering machine detection classifies the greeting (a menu, a person, voicemail). Mid call, a person who greets or offers help switches the agent from silent keys to talking. On the mock line, 0 reaches "Dana in claims", played by a model. |
@@ -80,7 +101,7 @@ rules' number filter and sent both numbers to the first rule.)
 `scripts/call.py` prints each step as it happens, then writes:
 
 - `logs/<call>.jsonl`, one line per step, e.g. `{"t": 13.18, "step": "answered_by", "category": "machine-ivr"}`.
-  Steps: `dialing`, `answered`, `no_answer`, `answered_by`, `heard`, `said`, `pressed`, `claim_number_given`,
+  Steps: `dialing`, `answered`, `no_answer`, `redialing`, `answered_by`, `heard`, `said`, `pressed`, `claim_number_given`,
   `status_captured`, `live_person`, `stuck`, `handoff`, `hung_up`, and a closing `summary` with the status,
   the keys pressed, who answered and how long it took. Samples: [`logs/sample/`](logs/sample/).
 - `logs/<call>.wav`, both sides in stereo, the agent on the left and the helpline on the right.
@@ -125,35 +146,38 @@ agent dials out through its trunk, the helpline answers on its own, and the keys
 
 | Call | Outcome | Time |
 |---|---|---|
-| Menu, claim 48213 | approved, keys `1` then `48213#` | 42.5 s |
-| Menu, claim 51007 | pending review | 40.6 s |
-| Menu, claim 66120 | denied | 38.4 s |
-| Menu, claim 99999 (does not exist) | no status, a person needs to call back: nothing invented | 42.7 s |
-| No claims option, claim 48213 | pressed `0`, a person detected, approved | 52.3 s |
-| No claims option, claim 51007 | pending review, from the person | 51.3 s |
-| No claims option, claim 66120 | denied, from the person | 46.2 s |
+| Menu, claim 48213 | approved, keys `1` then `48213#` | 41.1 s |
+| Menu, claim 51007 | pending review | 40.8 s |
+| Menu, claim 66120 | denied | 40.3 s |
+| Menu, claim 99999 (does not exist) | not found twice (it re-entered the number when asked), so a person needs to call back: nothing invented | 48.0 s |
+| No claims option, claim 48213 | pressed `0`, a person detected, approved | 54.4 s |
+| No claims option, claim 51007 | pending review, from the person | 46.0 s |
+| No claims option, claim 66120 | denied, from the person | 57.4 s |
 
 7 of 7 correct (22 Oct 2026). Every status was checked against the words heard, and the claim number was given
-once in every call. The same seven calls in loopback, on the code before the three fixes below, were also 7 of 7
-(29.7 to 62.7 s). Samples of both are in [`logs/sample/`](logs/sample/).
+once, except where the line asked for it again. The same seven calls in loopback, on the code before the four fixes
+below, were also 7 of 7 (29.7 to 62.7 s). Samples of both are in [`logs/sample/`](logs/sample/).
 
-The SIP calls caught three things loopback had not:
+The SIP calls caught four things loopback had not:
 
 - *The number said twice.* One model turn noted the person and gave the number while the opener waited for the
   person to pause, so the number was said, then said again inside the opener. The number now waits for the opener.
 - *A nudge over the answer.* The silence watchdog counted from when the eight second opener was queued, so it asked
   "are you able to check" six seconds after the opener ended, as the person read out the status. Quiet now counts
   from the end of speech.
-- *A refused login left the test hanging.* Once in 14 calls LiveKit refused the trunk's password (401). The agent
-  logged it as no answer, but left the room open, and `call.py` waited out the time limit. A failed dial now
-  closes the room as a hang-up does.
+- *A refused login.* Now and then LiveKit refused the trunk's password (401), three times in about thirty calls,
+  and every one went through when dialled again. The agent now dials once more after a refused login or a
+  timeout (never after busy or no such number), and a dial that still fails closes the room as a hang-up does:
+  before, `call.py` waited out the time limit.
+- *A hand-off after the answer.* Once the status was in, the model asked for a human "to complete the call
+  politely", and the log said the person could not give the status. A recorded status now rules a hand-off out.
 
 ## What I'd improve next
 
 - **Remember each insurer's menu.** The path to claim status rarely changes. Keep the keys that worked per
   number and press ahead, falling back to the model when a prompt no longer matches.
-- **Retry a failed dial.** A refused login or a busy line ends the call as no answer. One retry after a short
-  wait, then a callback later, would have saved the one refused SIP login above.
+- **Call back later.** A busy line or a second failed dial ends the call as no answer. A queue that calls back
+  after a while, at the insurer's opening hours, would finish those.
 - **Hold queues.** Real insurer lines hold for ten to forty minutes. Detect hold music, stay silent and cheap,
   and pick back up when a person or a prompt returns.
 - **Structured answers.** Status, paid amount, dates and denial reasons with a schema and a confidence,

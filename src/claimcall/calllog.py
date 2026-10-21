@@ -23,6 +23,7 @@ STEPS = {
     "dialing": "placing the call",
     "answered": "the line picked up",
     "no_answer": "nobody picked up",
+    "redialing": "the dial failed in a way worth one more try",
     "answered_by": "who answered: a phone menu, a person or voicemail",
     "heard": "what the helpline said",
     "said": "what the agent said",

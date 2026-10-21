@@ -152,3 +152,46 @@ async def test_the_number_is_said_once_when_the_person_is_noted_and_the_number_a
     await opener
     assert "opener" in told
     assert sum("4, 8, 2, 1, 3" in line for line in spoken) == 1
+
+
+def test_each_key_plays_its_own_two_tones():
+    # the menu call's agent side was silent: keys went as events only, so nobody listening heard a press
+    import numpy as np
+
+    rate = 8000
+    frames = caller.keypad_tones("5#", rate)
+    samples = np.concatenate([np.frombuffer(f.data, dtype=np.int16) for f in frames])
+    assert len(samples) == 2 * int(rate * caller.KEY_GAP_SECONDS)
+    tone = samples[: int(rate * caller.TONE_SECONDS)].astype(float)
+    spectrum, freqs = np.abs(np.fft.rfft(tone)), np.fft.rfftfreq(len(tone), 1 / rate)
+    low, high = sorted(freqs[np.argsort(spectrum)[-2:]])
+    assert abs(low - 770) < 10 and abs(high - 1336) < 10  # 5 is 770 Hz and 1336 Hz
+
+
+def test_only_a_refused_login_or_a_timeout_is_dialled_again():
+    assert caller.worth_redialing("no auth header in sip invite response (last response 401: Bad credentials)")
+    assert caller.worth_redialing("sip request timed out")
+    assert not caller.worth_redialing("INVITE failed: sip status: 404: No trunk found")
+    assert not caller.worth_redialing("INVITE failed: sip status: 486: Busy Here")
+
+
+async def test_a_call_with_its_status_is_never_handed_off(tmp_path, monkeypatch):
+    # a SIP call on 22 Oct: after "approved" was recorded, the model asked for a human "to complete the call
+    # politely", and the log said the person could not give the status
+    from types import SimpleNamespace
+
+    from claimcall.calllog import CallLog
+
+    agent = caller.ClaimCaller(
+        CallJob(claim_number="48213", phone_number="+15551234567"), CallLog("call", tmp_path), SimpleNamespace()
+    )
+    agent.person, agent.status = True, "approved"
+    told = await agent.ask_for_human(None, "complete call politely")
+    await agent.hand_off("no_progress", "watchdog")  # nothing to dial: it must return before touching the line
+    steps = (
+        [line for line in (tmp_path / "call.jsonl").read_text().splitlines() if line]
+        if (tmp_path / "call.jsonl").exists()
+        else []
+    )
+    assert "end_call" in told
+    assert not any('"step": "stuck"' in s or '"step": "handoff"' in s for s in steps)

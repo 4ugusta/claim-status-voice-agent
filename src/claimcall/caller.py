@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import time
+from array import array
 from dataclasses import dataclass
 
 from livekit import api, rtc
@@ -49,6 +51,41 @@ logger = logging.getLogger("claimcall.caller")
 
 DTMF_CODES = {**{str(d): d for d in range(10)}, "*": 10, "#": 11}
 KEY_GAP_SECONDS = 0.3  # between keys, so a phone system registers each one
+# The two frequencies a phone plays for each key (ITU-T Q.23).
+DTMF_HZ = {
+    "1": (697, 1209), "2": (697, 1336), "3": (697, 1477),
+    "4": (770, 1209), "5": (770, 1336), "6": (770, 1477),
+    "7": (852, 1209), "8": (852, 1336), "9": (852, 1477),
+    "*": (941, 1209), "0": (941, 1336), "#": (941, 1477),
+}  # fmt: skip
+TONE_SECONDS = 0.15
+# A dial refused with a login error or timed out is tried once more: on 22 Oct three SIP calls in about thirty
+# were refused (401) and each went through when dialled again. Busy or no such number is final.
+REDIAL_SECONDS = 2.0
+
+
+def worth_redialing(error: str) -> bool:
+    return bool(re.search(r"\b401\b|timed out|timeout", error or "", re.I))
+
+
+def keypad_tones(keys: str, rate: int) -> list[rtc.AudioFrame]:
+    """The keys as a phone plays them: each key's two tones, then quiet until the next key, in 20 ms frames."""
+    samples = array("h")
+    per_key, tone = int(rate * KEY_GAP_SECONDS), int(rate * TONE_SECONDS)
+    for k in keys:
+        low, high = DTMF_HZ[k]
+        samples.extend(
+            int(6000 * (math.sin(2 * math.pi * low * i / rate) + math.sin(2 * math.pi * high * i / rate)))
+            for i in range(tone)
+        )
+        samples.extend([0] * (per_key - tone))
+    step = rate // 50
+    return [
+        rtc.AudioFrame(samples[i : i + step].tobytes(), rate, 1, len(samples[i : i + step]))
+        for i in range(0, len(samples), step)
+    ]
+
+
 # Speech to text runs about a second behind the audio, so words heard just after a key press are still the
 # prompt that was playing before it (19 Oct: "for pharmacy benefits" arrived after pressing 1, and the agent
 # pressed 3). Only speech heard this long after a key counts as the line answering.
@@ -392,7 +429,8 @@ class ClaimCaller(Agent):
                 "the menu to finish if you have not heard one of those yet."
             )
         await self.send_keys(keys)
-        self.log.step("pressed", keys=keys, why=why)
+        # The menu's own words for the option, not the model's: it once logged 0, the representative, as "claims".
+        self.log.step("pressed", keys=keys, why=offered.get(keys, why) if len(keys) == 1 else why)
         self._progress()
         self.waiting_for_line = True
         return f"Pressed {keys}. Now wait for the line to respond; do nothing else this turn."
@@ -478,6 +516,10 @@ class ClaimCaller(Agent):
         """
         if self.finished:
             return "The call is over. Do nothing more."
+        if self.status is not None:
+            # A model once asked for a human "to complete the call politely" after the status was in, and the
+            # log said the person could not give the status.
+            return "The status is recorded, so nobody is needed. Thank them in one sentence, then call end_call."
         if self.waiting_for_line:
             return "Not yet: the line has not answered what you just did. Wait for it."
         if not (self.person or line_reports_failure(self.since_progress[-4:])):
@@ -547,6 +589,15 @@ class ClaimCaller(Agent):
 
     async def send_keys(self, keys: str) -> None:
         participant = self.ctx.room.local_participant
+        # The line acts on the DTMF events. The tones are played too, as a phone plays them, so a person listening
+        # (or the recording) hears each press: without them the agent's side of a menu call was silent.
+        frames = keypad_tones(keys, getattr(self.session.tts, "sample_rate", 24000))
+
+        async def tones():
+            for frame in frames:
+                yield frame
+
+        self.session.say(keys, audio=tones(), allow_interruptions=False, add_to_chat_ctx=False)
         for k in keys:
             await participant.publish_dtmf(code=DTMF_CODES[k], digit=k)
             await asyncio.sleep(KEY_GAP_SECONDS)
@@ -569,7 +620,7 @@ class ClaimCaller(Agent):
         whoever is on the insurer's end, and must never be read to a colleague (security review, 22 Oct 2026).
         The flag is set before the first await, so the stuck check, the watchdog, the time limit and the tool
         firing together dial the handoff number once."""
-        if self.finished or self.handing_off:
+        if self.finished or self.handing_off or self.status is not None:  # a call with its status needs nobody
             return
         self.handing_off = True
         brief = HANDOFF_REASONS.get(why, HANDOFF_REASONS["no_status"])
@@ -670,24 +721,30 @@ async def entrypoint(ctx: JobContext) -> None:
             log.step("answered", line="mock helpline in the same room (loopback)")
         else:
             log.step("dialing", to=masked(job.phone_number), claim_number=job.claim_number)
-            try:
-                await ctx.api.sip.create_sip_participant(
-                    api.CreateSIPParticipantRequest(
-                        room_name=ctx.room.name,
-                        sip_trunk_id=config.OUTBOUND_TRUNK_ID,
-                        sip_call_to=job.phone_number,
-                        participant_identity=identity,
-                        participant_name="Insurer helpline",
-                        wait_until_answered=True,
+            for attempt in (1, 2):
+                try:
+                    await ctx.api.sip.create_sip_participant(
+                        api.CreateSIPParticipantRequest(
+                            room_name=ctx.room.name,
+                            sip_trunk_id=config.OUTBOUND_TRUNK_ID,
+                            sip_call_to=job.phone_number,
+                            participant_identity=identity,
+                            participant_name="Insurer helpline",
+                            wait_until_answered=True,
+                        )
                     )
-                )
-            except api.TwirpError as exc:
-                log.step("no_answer", sip_status=exc.metadata.get("sip_status_code"), detail=exc.message)
-                # Close the room as a hang-up does: shutting down alone left anyone watching the call waiting
-                # out the time limit (a refused SIP login, 22 Oct 2026).
-                await agent.hang_up("no answer")
-                ctx.shutdown("no answer")
-                return
+                    break
+                except api.TwirpError as exc:
+                    log.step("no_answer", sip_status=exc.metadata.get("sip_status_code"), detail=exc.message)
+                    if attempt == 1 and worth_redialing(exc.message):
+                        log.step("redialing", after_seconds=REDIAL_SECONDS)
+                        await asyncio.sleep(REDIAL_SECONDS)
+                        continue
+                    # Close the room as a hang-up does: shutting down alone left anyone watching the call waiting
+                    # out the time limit (a refused SIP login, 22 Oct 2026).
+                    await agent.hang_up("no answer")
+                    ctx.shutdown("no answer")
+                    return
             log.step("answered", line="phone")
         verdict = await amd.execute()
     await agent.answered_by(verdict.category.value, getattr(verdict, "transcript", "") or "")

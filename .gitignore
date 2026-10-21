@@ -7,3 +7,4 @@ __pycache__/
 logs/*
 !logs/.gitkeep
 !logs/sample/
+.DS_Store
